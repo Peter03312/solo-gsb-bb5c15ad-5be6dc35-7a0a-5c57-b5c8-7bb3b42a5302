@@ -139,6 +139,31 @@ CREATE TABLE IF NOT EXISTS blackouts (
 CREATE INDEX IF NOT EXISTS idx_blackout_exhibit ON blackouts (exhibit_id, id);
 CREATE INDEX IF NOT EXISTS idx_blackout_plan ON blackouts (plan_id, id);
 
+-- 年度账册（封存）：保管员对“已结束自然年”按展品原子封存的用光账册。
+-- 封存沿用当前固定时区与既有剂量口径：
+--   合计 = 已确认实测剂量 + 各已批准/待复核计划“扣除已确认实测覆盖与本计划停灯后”的估算残余。
+-- 一经封存永久不可修改/覆盖（同展品同年唯一）；封存后实测纠错、计划状态或上限变化
+-- 仍按既有流程生效，账册始终保留封存时的快照值，差额由查询时按当前数据重算给出。
+CREATE TABLE IF NOT EXISTS annual_ledgers (
+    id                BIGSERIAL PRIMARY KEY,
+    exhibit_id        BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    year              INTEGER NOT NULL CHECK (year BETWEEN 1900 AND 2999),
+    limit_lxh         NUMERIC(12,3) NOT NULL,
+    confirmed_lxh     NUMERIC(12,3) NOT NULL,
+    residue_lxh       NUMERIC(12,3) NOT NULL,
+    total_lxh         NUMERIC(12,3) NOT NULL,
+    -- 逐项来源快照：[{ sourceKey:'measurement:31'|'plan:7', kind, id, doseLxh, yearly, ... }]
+    sources           JSONB NOT NULL,
+    -- 该年各计划停灯估算扣减合计（仅占用中的计划；与 sources 内各计划残余口径一致）
+    blackout_deduction_lxh NUMERIC(12,3) NOT NULL DEFAULT 0,
+    -- 封存时沿用的固定时区偏移（分钟），保证账册口径可追溯
+    tz_offset_minutes INTEGER NOT NULL,
+    sealed_by         BIGINT REFERENCES users(id),
+    sealed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (exhibit_id, year)
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_exhibit ON annual_ledgers (exhibit_id, year);
+
 -- 操作流水（审批、确认、状态变更等全部保留）
 CREATE TABLE IF NOT EXISTS audit_events (
     id              BIGSERIAL PRIMARY KEY,

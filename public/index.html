@@ -78,6 +78,19 @@
 
           <div id="limit-preview-box" class="card hidden conservator-only"></div>
 
+          <h4>年度账册封存</h4>
+          <p class="muted small">保管员可对<b>已结束的自然年</b>封存用光账册：原子记录当年上限、已确认实测、
+            各计划扣除实测覆盖与停灯后的估算残余、合计及逐项来源（沿用现有固定时区与剂量口径）。
+            未登记上限或年份未结束会被拒绝；同年重复提交不会覆盖旧账，账册永久不可改。
+            封存后实测纠错、计划状态或上限变化照常生效，此处展示封存值与按当前数据重算的差额（含逐项、已消失来源与零差额标示）。</p>
+          <form id="ledger-form" class="inline-form conservator-only">
+            <span>封存年份：</span>
+            <input name="year" type="number" min="1900" max="2999" placeholder="已结束年份，如 2025" required />
+            <button class="primary">封存该年账册</button>
+            <button type="button" id="ledger-refresh-btn">刷新差额</button>
+          </form>
+          <div id="ledger-list"></div>
+
           <h4>额度占用来源</h4>
           <div id="sources-list"></div>
 

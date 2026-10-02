@@ -220,6 +220,7 @@ function renderDetail() {
   $('#detail-meas-tbody').innerHTML = d.measurements.map(measRow).join('') ||
     '<tr><td colspan="7" class="muted">暂无实测</td></tr>';
   renderBlackouts(d);
+  renderLedgers(d);
 
   $$('.plan-action').forEach((btn) => btn.addEventListener('click', () => planAction(btn)));
   $$('.meas-action').forEach((btn) => btn.addEventListener('click', () => measAction(btn)));
@@ -255,6 +256,129 @@ function renderBlackouts(d) {
       : '<option value="">（暂无已批准/待复核计划）</option>';
   }
 }
+
+// ---------- 年度账册封存 ----------
+const LEDGER_STATUS_TEXT = { unchanged: '一致', changed: '已变化', disappeared: '已消失来源', new: '新增来源' };
+
+/** 渲染展品详情中的封存账册列表（逐条拉取封存值/当前值/差额）。 */
+async function renderLedgers(d) {
+  const box = $('#ledger-list');
+  if (!box) return;
+  const ledgers = d.ledgers || [];
+  if (!ledgers.length) {
+    box.innerHTML = '<p class="muted small">暂无封存账册。仅可封存已结束自然年。</p>';
+    return;
+  }
+  box.innerHTML = ledgers.map((l) => `
+    <div class="card ledger-card" id="ledger-card-${l.year}">
+      <div class="panel-head">
+        <h4>${l.year} 年账册 #${l.id}
+          <span class="muted small">封存于 ${new Date(l.sealedAt).toLocaleString('zh-CN')} · ${esc(l.sealedByName || '—')} · 固定时区 UTC${l.tzOffsetMinutes >= 0 ? '+' : ''}${l.tzOffsetMinutes / 60}</span>
+        </h4>
+        <button type="button" class="link small-btn ledger-toggle" data-year="${l.year}">展开差额</button>
+      </div>
+      <div class="ledger-summary small" data-year="${l.year}"></div>
+      <div class="ledger-detail hidden" data-year="${l.year}"></div>
+    </div>`).join('');
+  for (const l of ledgers) loadLedgerView(l.year, false);
+  $$('.ledger-toggle').forEach((btn) => btn.addEventListener('click', () => {
+    const det = document.querySelector(`.ledger-detail[data-year="${btn.dataset.year}"]`);
+    if (det) det.classList.toggle('hidden');
+  }));
+}
+
+/** 拉取并填充某年账册的封存值/当前值/差额视图。 */
+async function loadLedgerView(year, announce) {
+  if (!state.detail) return;
+  const exId = state.detail.exhibit.id;
+  let v;
+  try {
+    v = await api('GET', `/api/exhibits/${exId}/ledgers/${year}`);
+  } catch (err) {
+    flash('error', err.message);
+    return;
+  }
+  const row = (label, sealed, current, diff, unit = 'lx·h') => {
+    const cls = diff === 0 ? 'ok' : 'changed';
+    return `<tr>
+      <td>${label}</td>
+      <td class="mono">${fmtN(sealed)}</td>
+      <td class="mono">${fmtN(current)}</td>
+      <td class="mono ${cls}">${diff === 0 ? '<span class="ok">0（零差额）</span>' : (diff > 0 ? '+' : '') + fmtN(diff)}</td>
+      <td>${unit}</td>
+    </tr>`;
+  };
+  const df = v.differences;
+  const summary = document.querySelector(`.ledger-summary[data-year="${year}"]`);
+  if (summary) {
+    summary.innerHTML = `封存合计 <b class="mono">${fmtN(v.sealed.totalLxh)}</b> ＝ 已确认实测
+      <b class="mono">${fmtN(v.sealed.confirmedLxh)}</b> ＋ 估算残余 <b class="mono">${fmtN(v.sealed.residueLxh)}</b>
+      （上限 ${fmtN(v.sealed.limitLxh)}，停灯扣减 ${fmtN(v.sealed.blackoutDeductionLxh)}）；
+      当前合计 <b class="mono">${fmtN(v.current.totalLxh)}</b>，
+      合计差额 <b class="${df.allZero ? 'ok' : 'changed'}">${df.totalDifference === 0 ? '0（零差额）' : (df.totalDifference > 0 ? '+' : '') + fmtN(df.totalDifference)}</b>。`;
+  }
+  const detail = document.querySelector(`.ledger-detail[data-year="${year}"]`);
+  if (detail) {
+    const itemRows = df.items.map((it) => {
+      const name = it.kind === 'measurement'
+        ? `实测 #${it.id}（计划 #${it.planId}）${it.start ? `<div class="small muted">${esc(it.start)} ~ ${esc(it.end)}，${fmtN(it.lux)} lx</div>` : ''}`
+        : `计划 #${it.id}「${esc(it.title || '')}」${it.status ? `<div class="small muted">${badge(it.status)}</div>` : ''}`;
+      const dose = (x) => (x === null ? '<span class="muted">—（无）</span>' : fmtN(x));
+      const cls = it.zeroDifference ? 'ok' : 'changed';
+      return `<tr class="${it.status === 'disappeared' ? 'over-row' : ''}">
+        <td>${name}</td>
+        <td><span class="badge">${LEDGER_STATUS_TEXT[it.status] || it.status}</span></td>
+        <td class="mono">${dose(it.sealedDose)}</td>
+        <td class="mono">${dose(it.currentDose)}</td>
+        <td class="mono ${cls}">${it.zeroDifference ? '<span class="ok">0（零差额）</span>' : (it.difference > 0 ? '+' : '') + fmtN(it.difference)}</td>
+      </tr>`;
+    }).join('');
+    detail.innerHTML = `
+      <table class="data"><thead><tr><th>项目</th><th>封存</th><th>当前重算</th><th>差额</th><th></th></tr></thead>
+        <tbody>
+          ${row('年度上限', v.sealed.limitLxh, v.current.limitLxh, df.limitDifference)}
+          ${row('已确认实测合计', v.sealed.confirmedLxh, v.current.confirmedLxh, df.confirmedDifference)}
+          ${row('估算残余合计', v.sealed.residueLxh, v.current.residueLxh, df.residueDifference)}
+          ${row('合计（实测＋残余）', v.sealed.totalLxh, v.current.totalLxh, df.totalDifference)}
+          ${row('停灯估算扣减合计', v.sealed.blackoutDeductionLxh, v.current.blackoutDeductionLxh, df.blackoutDeductionDifference)}
+        </tbody></table>
+      <table class="data" style="margin-top:8px"><thead><tr>
+        <th>逐项来源（按编号对齐）</th><th>状态</th><th>封存剂量</th><th>当前剂量</th><th>差额</th>
+      </tr></thead><tbody>${itemRows}</tbody></table>`;
+  }
+  if (announce) flash('success', `${year} 年账册已封存，旧账永久保留、不可修改；差额已按当前数据重算列出`);
+}
+
+$('#ledger-form')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!state.detail) return;
+  const year = Number(new FormData(e.target).get('year'));
+  if (!Number.isInteger(year)) { flash('error', '请填写 1900-2999 的整数年份'); return; }
+  try {
+    const v = await api('POST', `/api/exhibits/${state.detail.exhibit.id}/ledgers`, { year });
+    state.detail = await api('GET', `/api/exhibits/${state.detail.exhibit.id}`);
+    renderDetail();
+    // 用刚封存的差额视图填充（此时差额全 0）
+    const box = document.querySelector(`#ledger-card-${year} .ledger-detail`);
+    if (box) {
+      box.classList.remove('hidden');
+      loadLedgerView(year, true);
+    }
+    void v;
+  } catch (err) {
+    if (err.status === 409 && err.data && err.data.existingLedgerId) {
+      flash('error', `${err.message}（既有账册 #${err.data.existingLedgerId}）`);
+    } else {
+      flash('error', err.message);
+    }
+  }
+});
+
+$('#ledger-refresh-btn')?.addEventListener('click', async () => {
+  if (!state.detail) return;
+  for (const l of state.detail.ledgers || []) await loadLedgerView(l.year, false);
+  flash('success', '已按当前数据重算各年账册差额');
+});
 
 $('#blackout-form')?.addEventListener('submit', async (e) => {
   e.preventDefault();

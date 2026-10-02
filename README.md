@@ -93,6 +93,24 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
       **占用下降不自动恢复任何既有待复核计划**（须保管员按既有重叠+额度口径复核）。
     - 展品详情与实测列表可**追溯前后记录与原因**（仅附加字段，既有字段不变）；
       实测纠错可链式进行（始终对当前有效的已确认记录发起）。
+16. **年度账册封存（conservator only）**：保管员可按**展品 + 已结束的自然年**封存**用光账册**。
+    - 封存沿用现有**固定时区**（`TZ_OFFSET_MINUTES`，账册记录该偏移）与既有**剂量口径**，在
+      **展品锁事务**内**原子记录**：当年**上限**、**已确认实测**合计、**各计划扣除已确认实测覆盖与
+      停灯后的估算残余**合计、两者**合计**，以及**逐项来源**（每条实测/计划按来源编号 `measurement:id` /
+      `plan:id`、该年剂量；另留存该年停灯估算扣减合计）。
+    - **未登记上限、年份未结束**（当前墙上自然年及未来年）返回 **400**；**已封存**同年再次提交返回
+      **409**（`details.existingLedgerId`），**重复提交绝不覆盖旧账**；数据库 `(exhibit_id, year)`
+      唯一约束兜底。
+    - 封存**只是快照，不改变任何占用/计划/实测/上限**。封存后**实测纠错、计划状态或上限变化仍按现有
+      流程生效**，**旧账始终不可改**。
+    - 展品详情附加 `ledgers`（封存摘要列表，既有字段不变）；`GET …/ledgers/:year` 可查看
+      **封存值**与**按当前数据重算的同年值**：上限/已确认实测/估算残余/合计（及停灯扣减）的**顶层差额**、
+      **按来源编号对齐的逐项差额**（`unchanged`/`changed`/`disappeared`/`new`）；
+      **已消失来源仍须列出**（封存时有、当前无贡献，`currentDose=null`），封存后新增来源标 `new`
+      （`sealedDose=null`）；**零差额逐项与顶层均明确标示**（`zeroDifference`/`allZero`）。
+    - **封存与同展品占用变动（审批/确认/纠错/停灯/调整/上下限）经同一展品锁串行化**，账册快照
+      要么是变动前、要么是变动后的**一致**状态，绝不混入变动前后的数据。既有查询字段和审批、实测接口
+      全部保持兼容。
 
 ## 一键启动（Docker Compose）
 
@@ -159,6 +177,14 @@ PGHOST=127.0.0.1 PGUSER=lightquota PGPASSWORD=lightquota_secret npm start
 npm run test:utils
 ```
 
+年度账册封存等全部业务流程的端到端自测（基于内存 pg，不需要真实数据库）：
+
+```bash
+npm run test:integration   # 既有 15 大业务规则
+npm run test:ledgers       # 年度账册封存专项
+npm test                   # 以上全部
+```
+
 ## 使用流程
 
 1. 保管员登录 → 「展品与额度」登记展品，并为相关自然年登记年度上限（lx·h）。
@@ -192,8 +218,13 @@ npm run test:utils
     不与同展品其他未作废实测或停灯相交；通过后旧记录保留并标记作废、替代记录直接确认并互相关联，
     按自然年重算已确认实测与估算残余。若纠错造成年度超额，纠错仍生效，相关未开始已批准计划转待复核；
     占用下降不会自动恢复待复核计划。展品详情可追溯前后记录与纠错原因。
+12. 某自然年结束、额度用光后，保管员在展品详情「年度账册封存」处填入**已结束年份**点「封存该年账册」：
+    系统在展品锁事务内原子封存该年上限、已确认实测、各计划扣除实测覆盖与停灯后的估算残余、合计及逐项来源；
+    未登记上限或年份未结束会被拒绝，已封存再次提交返回冲突且**不覆盖旧账**。封存不影响之后的实测纠错、
+    计划状态或上限变更（旧账始终不变）；在账册卡片上「展开差额」可查看封存值与按当前数据重算的同年值、
+    上限/合计差额及按来源编号对齐的逐项差额（已消失来源仍列出、零差额明确标示），或点「刷新差额」。
 
-## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记、**实测纠错**）
+## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记、**实测纠错**、**年度账册封存**）
 
 所有接口除 `/api/health`、`/api/auth/login` 外都需要登录会话（HttpOnly Cookie `lqsession`）。
 统一错误形态：`{ "error": "中文原因", "details": { ... } }`，409 用于冲突（重叠/超额/重复申请）。
@@ -216,7 +247,10 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | --- | --- | --- |
 | `GET  /api/exhibits` | 登录 | 展品列表 + 年度额度概况 |
 | `POST /api/exhibits` | 保管员 | 登记展品 |
-| `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源、计划（计划行内联 `pendingAdjustment`）、实测、`blackouts` 停灯记录（逐条带 `yearly`）与 `blackoutDeductionYearly` 各年扣减汇总 |
+| `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源、计划（计划行内联 `pendingAdjustment`）、实测、`blackouts` 停灯记录（逐条带 `yearly`）与 `blackoutDeductionYearly` 各年扣减汇总、`ledgers` 已封存年度账册摘要列表 |
+| `GET  /api/exhibits/:id/ledgers` | 登录 | 列出本展品全部封存账册（摘要，按年份倒序） |
+| `GET  /api/exhibits/:id/ledgers/:year` | 登录 | 某年封存账册对比视图：封存值 `sealed` + 当前重算值 `current` + 顶层/逐项差额 `differences` |
+| `POST /api/exhibits/:id/ledgers` | 保管员 | **封存**某已结束自然年账册；未登记上限/年份未结束 400，已封存 409 且不覆盖旧账 |
 | `POST /api/exhibits/:id/limits` | 保管员 | 登记/修改某自然年上限；**若为下调，同事务即时重算并把超额年未开始计划转待复核**（成功响应仍为展品详情，另附 `overflows`/`flaggedPlans`） |
 | `POST /api/exhibits/:id/limits/preview` | 保管员 | **下调预演**：不改状态，返回凭证与该年实测/各计划估算残余/预计超额/将转复核的计划 |
 | `POST /api/exhibits/:id/limits/lower` | 保管员 | **携预演凭证提交下调**；占用已变化返回 409 + 最新结果与新凭证 |
@@ -773,6 +807,120 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurements/31/
 审计写入一条 `measurement.correct`（target 为替代记录，detail 含原/替代编号、原因、前后时段照度
 与按年剂量、超额年份）；由纠错触发的计划转待复核写 `plan.flag_review`，原因中注明实测纠错。
 
+### 年度账册封存 `/api/exhibits/:id/ledgers`（保管员封存，全员只读）
+
+保管员按**展品 + 已结束自然年**封存用光账册。封存沿用现有固定时区与剂量口径，在展品锁事务内原子记录
+**当年上限、已确认实测、各计划扣除实测覆盖与停灯后的估算残余、合计及逐项来源**。
+
+- 年份必须是**已结束自然年**（当前墙上自然年及未来年 → 400）；该年**必须已登记上限**（否则 400）。
+- 同展品同年**只能封存一次**：重复提交 → **409**（`details.existingLedgerId`），旧账永不覆盖；
+  DB 层 `(exhibit_id, year)` 唯一约束兜底。
+- 布展员调用 `POST` → 403；`GET` 列表/对比视图任何登录用户均可查。
+- 封存**只是快照**，不改变占用/计划/实测/上限；封存后的实测纠错、计划状态或上限变化照常生效、旧账不可改。
+- 封存与同展品占用变动（审批/确认/纠错/停灯/调整/上下限）经同一展品锁串行化，账册不混入变动前后数据。
+
+```bash
+# 1) 保管员封存 2025 年账册（成功 201：返回封存值 + 当前重算值 + 差额，封存当下差额全为 0）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/exhibits/3/ledgers \
+  -H 'Content-Type: application/json' -d '{"year":2025}'
+
+# 2) 列出本展品全部封存账册
+curl -b cookies.txt http://localhost:3000/api/exhibits/3/ledgers
+
+# 3) 查看某年账册：封存值 vs 当前重算值 + 顶层/逐项差额
+curl -b cookies.txt http://localhost:3000/api/exhibits/3/ledgers/2025
+```
+
+封存成功响应（201）：
+
+```json
+{
+  "ledger": {
+    "id": 1, "exhibitId": 3, "year": 2025,
+    "sealedLimitLxh": 5000,
+    "sealedConfirmedLxh": 1200,
+    "sealedResidueLxh": 600,
+    "sealedTotalLxh": 1800,
+    "sealedBlackoutDeductionLxh": 200,
+    "sources": [
+      { "sourceKey": "measurement:31", "kind": "measurement", "id": 31, "planId": 7,
+        "label": "实测 #31", "start": "2025-06-01 09:00", "end": "2025-06-01 17:00",
+        "lux": 150, "doseLxh": 1200, "yearly": { "2025": 1200 } },
+      { "sourceKey": "plan:7", "kind": "plan", "id": 7, "title": "六月展", "status": "approved",
+        "startDate": "2025-06-01", "endDate": "2025-06-02", "periods": ["09:00-17:00"],
+        "lux": 100, "doseLxh": 600, "yearly": { "2025": 600 } }
+    ],
+    "tzOffsetMinutes": 480,
+    "sealedBy": 1, "sealedByName": "保管员（默认）",
+    "sealedAt": "2026-02-01T03:00:00.000Z"
+  },
+  "sealed":  { "limitLxh": 5000, "confirmedLxh": 1200, "residueLxh": 600, "totalLxh": 1800,
+               "blackoutDeductionLxh": 200 },
+  "current": { "limitLxh": 5000, "confirmedLxh": 1200, "residueLxh": 600, "totalLxh": 1800,
+               "blackoutDeductionLxh": 200 },
+  "differences": {
+    "limitDifference": 0, "totalDifference": 0,
+    "confirmedDifference": 0, "residueDifference": 0, "blackoutDeductionDifference": 0,
+    "allZero": true, "allItemDifferencesZero": true,
+    "items": [
+      { "sourceKey": "measurement:31", "kind": "measurement", "id": 31, "planId": 7,
+        "label": "实测 #31", "status": "unchanged",
+        "sealedDose": 1200, "currentDose": 1200, "difference": 0, "zeroDifference": true,
+        "sealed": { }, "current": { } },
+      { "sourceKey": "plan:7", "kind": "plan", "id": 7, "label": "计划 #7「六月展」",
+        "status": "unchanged",
+        "sealedDose": 600, "currentDose": 600, "difference": 0, "zeroDifference": true,
+        "sealed": { }, "current": { } }
+    ]
+  }
+}
+```
+
+封存之后再做实测纠错 / 上限调整 / 取消计划，`GET …/ledgers/:year` 的 `differences` 会给出：
+
+- 顶层：`limitDifference`、`confirmedDifference`、`residueDifference`、`totalDifference`、
+  `blackoutDeductionDifference`；全部为 0 时 `allZero: true`。
+- 逐项 `items`（按来源编号 `kind:id` 对齐，实测在前、计划在后）：
+  - `status`：`unchanged`（两边都在且剂量相同）/ `changed`（两边都在、剂量不同）/
+    `disappeared`（**封存时有、当前已无贡献——如计划取消或实测被纠错作废，仍列出**）/
+    `new`（封存后才出现的来源）；
+  - `sealedDose` / `currentDose`：消失来源 `currentDose=null`，新增来源 `sealedDose=null`；
+  - `difference`（当前 − 封存）与 **`zeroDifference`（布尔，零差额明确标示）**。
+
+例如把实测 #31（1200）纠错为 300 后：
+
+```json
+{
+  "sealed":  { "limitLxh": 5000, "confirmedLxh": 1200, "residueLxh": 600, "totalLxh": 1800 },
+  "current": { "limitLxh": 5000, "confirmedLxh": 300,  "residueLxh": 1100, "totalLxh": 1400 },
+  "differences": {
+    "limitDifference": 0, "confirmedDifference": -900,
+    "residueDifference": 500, "totalDifference": -400, "allZero": false,
+    "items": [
+      { "sourceKey": "measurement:31", "status": "disappeared",
+        "sealedDose": 1200, "currentDose": null, "difference": -1200, "zeroDifference": false },
+      { "sourceKey": "measurement:32", "status": "new",
+        "sealedDose": null, "currentDose": 300, "difference": 300, "zeroDifference": false },
+      { "sourceKey": "plan:7", "status": "changed",
+        "sealedDose": 600, "currentDose": 1100, "difference": 500, "zeroDifference": false }
+    ]
+  }
+}
+```
+
+常见拒绝：未登录 401；布展员封存 403；年份非法/年份未结束/该年未登记上限/展品不存在 → 400；
+未封存年份查询 → 400（`{ "error": "展品 #3 2025 年账册尚未封存" }`）；
+同年重复封存 → 409：
+
+```json
+{
+  "error": "展品 #3 2025 年账册已封存（账册 #1），账册永久保留，重复提交不会覆盖旧账",
+  "details": { "existingLedgerId": 1, "exhibitId": 3, "year": 2025 }
+}
+```
+
+审计写入一条 `ledger.seal`（target 为账册 id，detail 含展品/年份/上限/实测/残余/合计/停灯扣减/来源数/时区偏移）。
+
 
 
 ```
@@ -786,11 +934,14 @@ src/
   auth.js          会话与角色中间件、bcrypt 登录校验
   audit.js         操作流水写入
   limit-preview.js 下调上限预演凭证（签发/一次性消耗/占用指纹）
+  ledgers.js       年度账册封存：封存快照（沿用固定时区与剂量口径）、账册读写、封存值与当前重算值的顶层/逐项差额
   validation.js    中文输入校验（时段/日期/正数等）
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
   service.js       额度占用计算、批准校验、实测窗口校验、实测纠错（旧记录作废+替代记录确认+关联）、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组试算/核对、下调上限预演核算、停灯登记校验与按年扣减
-  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/blackouts/audit 路由
+  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/blackouts/ledgers（年度账册封存与差额对比）/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试
+scripts/test-integration.js  既有业务端到端测试
+scripts/test-ledgers.js     年度账册封存专项测试
 Dockerfile / docker-compose.yml
 ```

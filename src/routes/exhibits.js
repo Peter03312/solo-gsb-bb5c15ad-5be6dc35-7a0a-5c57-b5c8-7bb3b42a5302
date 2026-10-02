@@ -66,6 +66,10 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
   const blackouts = (occupancy.blackouts || []).map(serializeBlackoutViewItem);
   const blackoutDeductionYearly = occupancy.blackoutDeductionYearly || {};
 
+  // 年度封存账册摘要（仅附加字段；逐项封存/当前差额走 /api/exhibits/:id/ledgers/:year）
+  const { listLedgers } = require('../ledgers');
+  const ledgers = await listLedgers(client, exhibitId);
+
   return {
     exhibit,
     years: occupancy.years,
@@ -74,6 +78,7 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     measurements,
     blackouts,
     blackoutDeductionYearly,
+    ledgers,
   };
 }
 
