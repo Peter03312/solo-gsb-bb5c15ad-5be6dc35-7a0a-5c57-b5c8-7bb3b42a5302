@@ -1938,6 +1938,234 @@ async function runFlow() {
     '操作流水记录了下调上限导致的转待复核');
   assert(r.body.events.some((e) => e.action === 'limit.upsert'),
     '操作流水记录了登记/修改上限');
+
+  // =======================================================================
+  // 年度用光账册封存（保管员，规则 16）：
+  //   仅可封存已结束自然年；未登记上限/年份未结束/已封存拒绝；重复提交不覆盖旧账；
+  //   封存原子记录上限、已确认实测、各计划估算残余、合计与逐项来源；
+  //   封存后实测纠错/计划状态/上限变化照常生效，旧账不可改；
+  //   展品详情/账册接口对照封存值与按当前数据重算值：合计差额、按来源编号逐项差额、
+  //   已消失来源仍列出、零差额明确标示；封存与同展品占用变动串行、不混入前后数据。
+  // =======================================================================
+  const exLd = await createExhibit('账册封存展品');
+  const wallYearNow = Number(dosing.tsToWall(Date.now()).ymd.slice(0, 4));
+  const sealYear = wallYearNow - 2; // 确定已结束、且与“未结束/上一年”场景区分开
+  // 两个已结束年份：sealYear 用于封存，sealYear+1 为未登记上限的拒绝场景兜底
+  await call('POST', `/api/exhibits/${exLd}/limits`, { year: sealYear, limitLxh: 100000 }, 'c');
+
+  // 计划 P1：sealYear-05-01 09:00-17:00（8h），100lx，毛估算 800
+  const ldP1 = await submitPlan(exLd, '账册计划1', `${sealYear}-05-01`, `${sealYear}-05-01`,
+    ['09:00-17:00'], 100);
+  await approvePlan(ldP1);
+  // 计划 P2：sealYear-06-01 18:00-22:00（4h），100lx = 400
+  const ldP2 = await submitPlan(exLd, '账册计划2', `${sealYear}-06-01`, `${sealYear}-06-01`,
+    ['18:00-22:00'], 100);
+  await approvePlan(ldP2);
+
+  // ---- 组成性拒绝：未登记上限 / 年份未结束 / 越权 / 非法年份 ----
+  const wallY = wallYearNow; // UTC+8 墙上当前年（未结束）
+  r = await call('POST', `/api/exhibits/${exLd}/ledgers`, { year: sealYear + 1 }, 'i');
+  assert(r.status === 403, '布展员不能封存账册（越权）');
+  r = await call('POST', `/api/exhibits/${exLd}/ledgers`, { year: sealYear + 1 }, 'c');
+  assert(r.status === 400 && /尚未登记/.test(r.body.error), '未登记上限的年份拒绝封存');
+  r = await call('POST', `/api/exhibits/${exLd}/ledgers`, { year: wallY }, 'c');
+  assert(r.status === 400 && /尚未结束/.test(r.body.error), '当前（未结束）年份拒绝封存');
+  r = await call('POST', `/api/exhibits/${exLd}/ledgers`, { year: wallY - 1 }, 'c');
+  assert(r.status === 400 && /尚未登记/.test(r.body.error),
+    '上一年（已结束但未登记上限）按未登记上限拒绝');
+  r = await call('POST', `/api/exhibits/${exLd}/ledgers`, { year: 1800 }, 'c');
+  assert(r.status === 400, '非法年份拒绝封存');
+  r = await call('POST', `/api/exhibits/${exLd}/ledgers`, {}, 'c');
+  assert(r.status === 400, '缺少年份拒绝封存');
+
+  // ---- 封存前先做两项占用变动：确认实测（替代估算）+ 停灯扣减 ----
+  // P1 09:00-12:00 实测 150lx = 450（替代该 3h 的 300 估算）
+  r = await call('POST', '/api/measurements', {
+    planId: ldP1, startDate: `${sealYear}-05-01`, startTime: '09:00',
+    endDate: `${sealYear}-05-01`, endTime: '12:00', actualLux: 150,
+  }, 'c');
+  assert(r.status === 201, '录入账册实测草稿');
+  const ldMeas = r.body.measurement.id;
+  r = await call('POST', `/api/measurements/${ldMeas}/confirm`, {}, 'c');
+  assert(r.status === 200, '确认账册实测');
+  // P2 停灯 19:00-20:00（1h×100=100），残余 400 → 300（直接 SQL 预置，历史已发生时段）
+  await dbModule.withTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO blackouts (plan_id, exhibit_id, start_ts, end_ts, reason, created_by)
+       VALUES ($1, $2, $3, $4, $5, NULL)`,
+      [ldP2, exLd,
+        new Date(dosing.wallToTs(`${sealYear}-06-01`, 19 * 60)),
+        new Date(dosing.wallToTs(`${sealYear}-06-01`, 20 * 60)),
+        '封存前停灯']
+    );
+  });
+  // 封存前口径：实测 450；P1 残余 (8-3)h*100=500；P2 残余 (4-1)h*100=300；合计 1250
+  r = await call('GET', `/api/exhibits/${exLd}`, null, 'i');
+  assert(r.body.years[String(sealYear)].used === 1250,
+    `封存前 ${sealYear} 占用=450+500+300=1250，实际 ${r.body.years[String(sealYear)].used}`);
+
+  // ---- 成功封存：原子记录上限/实测/残余/合计/逐项 ----
+  r = await call('POST', `/api/exhibits/${exLd}/ledgers`, { year: sealYear }, 'c');
+  assert(r.status === 201, `封存成功（实际 ${r.status} ${r.body && r.body.error}）`);
+  const ledgerId = r.body.ledger.id;
+  const lg = r.body.ledger;
+  assert(lg.limit === 100000 && lg.confirmedTotal === 450 &&
+    lg.residueTotal === 800 && lg.total === 1250,
+    `封存值：上限100000/实测450/残余800/合计1250，实际=${JSON.stringify({
+      l: lg.limit, c: lg.confirmedTotal, r: lg.residueTotal, t: lg.total })}`);
+  const itemMeas = lg.items.find((it) => it.kind === 'measurement' && it.id === ldMeas);
+  const itemP1 = lg.items.find((it) => it.kind === 'plan' && it.id === ldP1);
+  const itemP2 = lg.items.find((it) => it.kind === 'plan' && it.id === ldP2);
+  assert(itemMeas && itemMeas.yearDose === 450, '逐项来源含已确认实测 450');
+  assert(itemP1 && itemP1.yearDose === 500, '逐项来源含计划1 估算残余 500');
+  assert(itemP2 && itemP2.yearDose === 300, '逐项来源含计划2 估算残余 300（已扣停灯）');
+  assert(lg.sealedBy != null && lg.sealedAt, '记录封存人与封存时刻');
+
+  // ---- 重复提交不得覆盖旧账（409，指明既有账册）----
+  r = await call('POST', `/api/exhibits/${exLd}/ledgers`, { year: sealYear }, 'c');
+  assert(r.status === 409 && /不可修改或覆盖/.test(r.body.error) &&
+    r.body.details.existingLedgerId === ledgerId,
+    '重复封存被拒（409）且不覆盖旧账');
+  r = await call('GET', `/api/exhibits/${exLd}/ledgers`, null, 'i');
+  assert(r.body.ledgers.length === 1 && r.body.ledgers[0].id === ledgerId,
+    '重复封存未产生新账册');
+
+  // ---- 旧账不可改删 ----
+  r = await call('DELETE', `/api/exhibits/${exLd}/ledgers/${sealYear}`, {}, 'c');
+  assert(r.status === 400 && /不可删除/.test(r.body.error), '账册不可删除');
+  r = await call('PUT', `/api/exhibits/${exLd}/ledgers/${sealYear}`, { limitLxh: 1 }, 'c');
+  assert(r.status === 400 && /不可修改/.test(r.body.error), '账册不可修改');
+
+  // ---- 封存瞬间对照：全部零差额并明确标示 ----
+  r = await call('GET', `/api/exhibits/${exLd}/ledgers/${sealYear}`, null, 'i');
+  assert(r.status === 200, '查询封存账册及对照');
+  const cmp = r.body.comparison;
+  assert(cmp.totals.total.zeroDifference === true && cmp.totals.limit.zeroDifference === true,
+    '封存瞬间合计与上限零差额并标示');
+  assert(cmp.itemDiffs.length === 3 && cmp.itemDiffs.every((it) => it.zeroDifference === true),
+    '封存瞬间逐项零差额且明确标示');
+
+  // ---- 封存后：实测纠错、计划状态、上限变化仍按现有流程生效；旧账不变 ----
+  // 1) 实测纠错：450 → 09:00-13:00 200lx = 800
+  r = await call('POST', `/api/measurements/${ldMeas}/correct`, {
+    startDate: `${sealYear}-05-01`, startTime: '09:00',
+    endDate: `${sealYear}-05-01`, endTime: '13:00', actualLux: 200,
+    reason: '封存后核对纠错',
+  }, 'c');
+  assert(r.status === 200, '封存后实测纠错照常生效');
+  const ldMeas2 = r.body.correction.replacementMeasurementId;
+  // 2) 计划取消：P2 退出占用（残余 300 消失）
+  await call('POST', `/api/plans/${ldP2}/cancel`, {}, 'c');
+  // 3) 上限变化：100000 → 90000
+  await call('POST', `/api/exhibits/${exLd}/limits`, { year: sealYear, limitLxh: 90000 }, 'c');
+
+  // 当前重算：实测 800；P1 残余 (8-4)h*100=400；P2 已取消无残余；合计 1200
+  r = await call('GET', `/api/exhibits/${exLd}/ledgers/${sealYear}`, null, 'i');
+  const cur = r.body.current;
+  assert(cur.limit === 90000 && cur.confirmedTotal === 800 &&
+    cur.residueTotal === 400 && cur.total === 1200,
+    `当前重算：上限90000/实测800/残余400/合计1200，实际=${JSON.stringify(cur)}`);
+  // 封存值原样不变
+  const sl = r.body.ledger;
+  assert(sl.limit === 100000 && sl.confirmedTotal === 450 &&
+    sl.residueTotal === 800 && sl.total === 1250,
+    '封存后旧账封存值始终不变');
+  // 合计差额：上限 -10000；实测 +350；残余 -400；合计 -50
+  const t = r.body.comparison.totals;
+  assert(t.limit.delta === -10000 && t.confirmedTotal.delta === 350 &&
+    t.residueTotal.delta === -400 && t.total.delta === -50,
+    `合计/上限差额正确，实际=${JSON.stringify(t)}`);
+  assert(t.total.zeroDifference === false && t.allZero === false, '有差额时零差额标记为 false');
+
+  // ---- 按来源编号对齐逐项差额；已消失来源仍列出；新增来源列出 ----
+  const diffs = r.body.comparison.itemDiffs;
+  // 旧实测 #ldMeas 已作废（不再占用）→ 已消失来源，仍列出
+  const dOldMeas = diffs.find((x) => x.sourceKey === `measurement:${ldMeas}`);
+  assert(dOldMeas && dOldMeas.present === false && dOldMeas.sealedDose === 450 &&
+    dOldMeas.currentDose === null && dOldMeas.delta === -450,
+    '已作废旧实测作为已消失来源仍列出（封存450/当前null/差额-450）');
+  // 替代实测 #ldMeas2：封存后新增来源
+  const dNewMeas = diffs.find((x) => x.sourceKey === `measurement:${ldMeas2}`);
+  assert(dNewMeas && dNewMeas.sealed === false && dNewMeas.sealedDose === null &&
+    dNewMeas.currentDose === 800 && dNewMeas.delta === 800,
+    '纠错替代实测作为新增来源列出（封存null/当前800）');
+  // P1 残余 500 → 400（被更大的替代实测多覆盖 1h）
+  const dP1 = diffs.find((x) => x.sourceKey === `plan:${ldP1}`);
+  assert(dP1 && dP1.present === true && dP1.sealedDose === 500 &&
+    dP1.currentDose === 400 && dP1.delta === -100 && dP1.zeroDifference === false,
+    '计划1 残余逐项差额 500→400');
+  // P2 已取消：已消失计划来源仍列出
+  const dP2 = diffs.find((x) => x.sourceKey === `plan:${ldP2}`);
+  assert(dP2 && dP2.present === false && dP2.sealedDose === 300 &&
+    dP2.currentDose === null, '已取消计划作为已消失来源仍列出（封存300/当前null）');
+
+  // ---- 展品详情附加 ledgers（仅附加字段，既有字段兼容）----
+  r = await call('GET', `/api/exhibits/${exLd}`, null, 'i');
+  assert(Array.isArray(r.body.ledgers) && r.body.ledgers.length === 1 &&
+    r.body.ledgers[0].id === ledgerId, '展品详情附已封存账册列表');
+  const detailCmp = r.body.ledgers[0].comparison;
+  assert(detailCmp && detailCmp.totals.total.delta === -50 &&
+    detailCmp.itemDiffs.some((x) => x.sourceKey === `plan:${ldP2}` && x.present === false),
+    '展品详情账册对照含合计与已消失来源差额');
+  assert(r.body.years && r.body.sources && r.body.plans && r.body.measurements &&
+    r.body.blackouts !== undefined, '展品详情既有字段全部保持兼容');
+
+  // 封存年份的额度表仍按当前数据展示（封存不冻结查询口径）
+  assert(r.body.years[String(sealYear)].limit === 90000 &&
+    r.body.years[String(sealYear)].used === 1200,
+    '年度额度表继续按当前数据重算（封存只另存账册）');
+
+  // ---- 未封存年份查询 404 ----
+  r = await call('GET', `/api/exhibits/${exLd}/ledgers/${sealYear + 1}`, null, 'i');
+  assert(r.status === 404 && /尚无封存账册/.test(r.body.error), '未封存年份查询返回 404');
+
+  // ---- 零差额场景：另一件展品封存后数据不变，所有差额均明确标示为零 ----
+  const exLd2 = await createExhibit('账册零差额展品');
+  await call('POST', `/api/exhibits/${exLd2}/limits`, { year: sealYear, limitLxh: 5000 }, 'c');
+  const ldQ = await submitPlan(exLd2, '零差额计划', `${sealYear}-02-01`, `${sealYear}-02-01`,
+    ['09:00-17:00'], 100); // 800
+  await approvePlan(ldQ);
+  r = await call('POST', `/api/exhibits/${exLd2}/ledgers`, { year: sealYear }, 'c');
+  assert(r.status === 201, '零差额展品封存成功');
+  r = await call('GET', `/api/exhibits/${exLd2}/ledgers?compare=1`, null, 'i');
+  const z = r.body.ledgers[0].comparison;
+  assert(z.totals.allZero === true &&
+    z.itemDiffs.length === 1 && z.itemDiffs[0].zeroDifference === true &&
+    z.itemDiffs[0].sealedDose === 800 && z.itemDiffs[0].currentDose === 800,
+    '数据未变化时合计与逐项零差额均明确标示');
+
+  // ---- 封存与同展品占用变动并发：账册不混入变动前后的数据（应用键锁 + 行锁串行）----
+  const exLd3 = await createExhibit('账册并发展品');
+  await call('POST', `/api/exhibits/${exLd3}/limits`, { year: sealYear, limitLxh: 100000 }, 'c');
+  const ldC1 = await submitPlan(exLd3, '并发账册计划', `${sealYear}-03-01`, `${sealYear}-03-01`,
+    ['09:00-17:00'], 100);
+  await approvePlan(ldC1);
+  // 先录一条待确认实测草稿（不计量），并发：保管员确认实测（占用变动）+ 封存同年账册
+  r = await call('POST', '/api/measurements', {
+    planId: ldC1, startDate: `${sealYear}-03-01`, startTime: '09:00',
+    endDate: `${sealYear}-03-01`, endTime: '12:00', actualLux: 200,
+  }, 'c');
+  const ldDraft = r.body.measurement.id;
+  const [confirmRes, sealRes] = await Promise.all([
+    call('POST', `/api/measurements/${ldDraft}/confirm`, {}, 'c'),
+    call('POST', `/api/exhibits/${exLd3}/ledgers`, { year: sealYear }, 'c'),
+  ]);
+  assert(confirmRes.status === 200 && sealRes.status === 201,
+    '并发的确认实测与封存都成功（串行执行）');
+  // 两者必居其一的一致快照：要么账册不含该实测（残余800），要么完整含入（实测600+残余500=1100），
+  // 绝不能出现半更新（如实测600但残余仍800）。
+  const sealed3 = sealRes.body.ledger;
+  const consistent =
+    (sealed3.confirmedTotal === 0 && sealed3.residueTotal === 800 && sealed3.total === 800) ||
+    (sealed3.confirmedTotal === 600 && sealed3.residueTotal === 500 && sealed3.total === 1100);
+  assert(consistent,
+    `并发封存账册为变动前或变动后的一致快照，实际=${JSON.stringify({
+      c: sealed3.confirmedTotal, r: sealed3.residueTotal, t: sealed3.total })}`);
+
+  // ---- 操作流水：封存事件 ----
+  r = await call('GET', '/api/audit?limit=1000', null, 'c');
+  assert(r.body.events.some((e) => e.action === 'ledger.seal' &&
+    Number(e.target_id) === ledgerId), '操作流水记录了账册封存');
 }
 
 main().catch((err) => {

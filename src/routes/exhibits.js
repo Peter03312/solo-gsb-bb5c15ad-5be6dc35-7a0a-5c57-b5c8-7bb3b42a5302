@@ -8,6 +8,13 @@ const { ValidationError, ConflictError, nonEmptyString, positiveNumber } = requi
 const { computeOccupancy, lockExhibit, decoratePlans, computeLimitPreview } = require('../service');
 const { tsToWallString } = require('../dosing');
 const { fingerprintSnapshot, issueVoucher, peekVoucher, consumeVoucher } = require('../limit-preview');
+const {
+  listSealedLedgers,
+  snapshotFromLedgerRow,
+  diffSnapshots,
+  serializeLedger,
+  buildYearSnapshot,
+} = require('../ledger');
 
 const router = express.Router();
 
@@ -66,6 +73,15 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
   const blackouts = (occupancy.blackouts || []).map(serializeBlackoutViewItem);
   const blackoutDeductionYearly = occupancy.blackoutDeductionYearly || {};
 
+  // 已封存年度账册（不可变）：附按当前数据重算的对照差额（仅附加字段，不影响既有消费者）
+  const ledgerRows = await listSealedLedgers(client, exhibitId);
+  const ledgers = [];
+  for (const row of ledgerRows) {
+    const sealedSnap = snapshotFromLedgerRow(row);
+    const currentSnap = await buildYearSnapshot(client, exhibitId, sealedSnap.year);
+    ledgers.push(serializeLedger(row, diffSnapshots(sealedSnap, currentSnap)));
+  }
+
   return {
     exhibit,
     years: occupancy.years,
@@ -74,6 +90,7 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     measurements,
     blackouts,
     blackoutDeductionYearly,
+    ledgers,
   };
 }
 

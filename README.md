@@ -93,6 +93,20 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
       **占用下降不自动恢复任何既有待复核计划**（须保管员按既有重叠+额度口径复核）。
     - 展品详情与实测列表可**追溯前后记录与原因**（仅附加字段，既有字段不变）；
       实测纠错可链式进行（始终对当前有效的已确认记录发起）。
+16. **年度用光账册封存（conservator only）**：保管员可按**展品 + 已结束的自然年**封存一份用光账册。
+    - 封存沿用**现有固定时区与统一剂量口径**，在展品锁事务内**原子记录**：**当年上限**、
+      **已确认实测**剂量合计、**各计划**“开灯窗 − 已确认实测覆盖 − 本计划停灯”的**估算残余**合计、
+      **合计**（= 实测合计 + 残余合计）及**逐项来源**（每条来源的按年剂量、时段/计划等溯源字段）。
+    - **未登记当年上限、年份尚未结束或该年已封存时拒绝**；**重复提交不得覆盖旧账**（409，指明既有账册编号）。
+      账册一经封存**永久不可修改/删除**（PUT/DELETE 返回 400）。
+    - 封存**不冻结**任何既有流程：之后**实测纠错、计划状态/调整、上限变化仍按现有流程生效**，
+      旧账始终原样保留、不可改。
+    - **展品详情与账册接口可对照**：封存值与**按当前数据重算的同年值**，含**上限和合计差额**，以及
+      **按来源编号对齐的逐项差额**；**已消失来源仍须列出**（封存后作废的实测、取消的计划等，当前值标空），
+      封存后新增来源同样列出；**零差额明确标示**（`zeroDifference: true` / 页面「0（无差额）」）。
+    - **封存与同展品占用变动并发**时，经同一展品键锁 + 行锁串行：账册只可能是变动前或变动后的
+      **一致快照**，绝不混入变动前后的数据。
+    - 既有查询字段与审批、实测接口**保持兼容**（展品详情仅附加 `ledgers` 字段）。
 
 ## 一键启动（Docker Compose）
 
@@ -187,13 +201,18 @@ npm run test:utils
     与其他已批准/待复核计划重叠、超额/未登记上限）；确认无误后由保管员**提交联合核准**：
     系统在锁事务内重新核对计划状态与实时占用，全部通过才一次批准整组（逐条 + 汇总留痕），
     任一失败整组计划与审计均不变，并返回涉及的计划、年份与冲突原因。
+12. 自然年结束后，保管员在展品详情「年度用光账册」处填入**已结束年份**点「封存账册」：
+    系统原子记录该年上限、已确认实测、各计划扣除实测覆盖与停灯后的估算残余、合计与逐项来源
+    （沿用固定时区与现有剂量口径）。未登记上限、年份未结束或已封存都会被拒绝，重复提交不覆盖旧账。
+    封存后实测纠错、计划状态或上限变化照常生效；详情页与接口始终对照「封存值 vs 按当前数据重算值」：
+    上限与合计差额、按来源编号对齐的逐项差额、已消失来源（仍列出）、零差额明确标示。
 11. 展后发现**已确认实测**的时段或照度录错时，保管员在展品详情「实测记录」或「实测记录」页对该记录点
     **「纠错」**：填替代时段、替代照度与必填原因后提交。系统校验替代时段完整处于原计划开灯窗内、
     不与同展品其他未作废实测或停灯相交；通过后旧记录保留并标记作废、替代记录直接确认并互相关联，
     按自然年重算已确认实测与估算残余。若纠错造成年度超额，纠错仍生效，相关未开始已批准计划转待复核；
     占用下降不会自动恢复待复核计划。展品详情可追溯前后记录与纠错原因。
 
-## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记、**实测纠错**）
+## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记、**实测纠错**、**年度账册封存**）
 
 所有接口除 `/api/health`、`/api/auth/login` 外都需要登录会话（HttpOnly Cookie `lqsession`）。
 统一错误形态：`{ "error": "中文原因", "details": { ... } }`，409 用于冲突（重叠/超额/重复申请）。
@@ -216,7 +235,10 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | --- | --- | --- |
 | `GET  /api/exhibits` | 登录 | 展品列表 + 年度额度概况 |
 | `POST /api/exhibits` | 保管员 | 登记展品 |
-| `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源、计划（计划行内联 `pendingAdjustment`）、实测、`blackouts` 停灯记录（逐条带 `yearly`）与 `blackoutDeductionYearly` 各年扣减汇总 |
+| `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源、计划（计划行内联 `pendingAdjustment`）、实测、`blackouts` 停灯记录（逐条带 `yearly`）与 `blackoutDeductionYearly` 各年扣减汇总、`ledgers` 已封存年度账册（每条附封存值与当前重算对照 `comparison`） |
+| `GET  /api/exhibits/:id/ledgers` | 登录 | 已封存年度账册列表；`?compare=1` 附按当前数据重算的对照差额 |
+| `POST /api/exhibits/:id/ledgers` | 保管员 | **封存某已结束自然年的用光账册**（原子快照）；未登记上限/年份未结束 400，重复封存 409 不覆盖旧账 |
+| `GET  /api/exhibits/:id/ledgers/:year` | 登录 | 某年封存账册 + 按当前数据重算值 + 上限/合计差额 + 按来源编号逐项差额（已消失来源仍列出，零差额标示） |
 | `POST /api/exhibits/:id/limits` | 保管员 | 登记/修改某自然年上限；**若为下调，同事务即时重算并把超额年未开始计划转待复核**（成功响应仍为展品详情，另附 `overflows`/`flaggedPlans`） |
 | `POST /api/exhibits/:id/limits/preview` | 保管员 | **下调预演**：不改状态，返回凭证与该年实测/各计划估算残余/预计超额/将转复核的计划 |
 | `POST /api/exhibits/:id/limits/lower` | 保管员 | **携预演凭证提交下调**；占用已变化返回 409 + 最新结果与新凭证 |
@@ -773,6 +795,99 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurements/31/
 审计写入一条 `measurement.correct`（target 为替代记录，detail 含原/替代编号、原因、前后时段照度
 与按年剂量、超额年份）；由纠错触发的计划转待复核写 `plan.flag_review`，原因中注明实测纠错。
 
+### 年度用光账册封存 `/api/exhibits/:id/ledgers`（保管员封存，登录可读）
+
+保管员可按**展品 + 已结束自然年**封存一份**不可变**用光账册。封存沿用现有固定时区与统一剂量口径，
+在同一展品锁事务内**原子记录**：
+
+- `limit`：该年年度上限（封存时必须已登记，否则 400）；
+- `confirmedTotal`：该年**已确认实测**剂量合计（停灯不减实测）；
+- `residueTotal`：各**已批准/待复核**计划在该年的**估算残余**合计
+  （= 开灯窗 − 已确认实测覆盖 − 本计划停灯，按计划预计照度计）；
+- `total`：合计 = `confirmedTotal + residueTotal`；
+- `items`：**逐项来源**，`kind=measurement`（实测，含时段/照度/计划编号）或 `kind=plan`
+  （计划估算残余，含名称/状态/展期/开灯时段/照度），每条带该年 `yearDose` 与稳定 `sourceKey`
+  （`measurement:ID` / `plan:ID`，供逐项差额对齐）。
+
+拒绝规则：布展员封存 → 403；年份非法/缺省 → 400；**该年未登记上限** → 400；
+**年份尚未结束**（墙上当前年份或未来年）→ 400；**该年已封存** → **409**（`details.existingLedgerId`），
+重复提交**不覆盖旧账**；`PUT/DELETE` 账册 → 400（旧账永久保留、不可改删）。
+
+```bash
+# 1) 保管员封存某已结束自然年（201 Created；响应含封存账册，comparison 为封存瞬间全零差额对照）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/exhibits/3/ledgers \
+  -H 'Content-Type: application/json' -d '{"year":2024}'
+
+# 2) 登录用户列出某展品全部已封存账册（?compare=1 附按当前数据重算的对照差额）
+curl -b cookies.txt 'http://localhost:3000/api/exhibits/3/ledgers?compare=1'
+
+# 3) 取某年封存账册 + 当前重算值 + 合计/逐项差额
+curl -b cookies.txt http://localhost:3000/api/exhibits/3/ledgers/2024
+```
+
+封存成功响应（`ledger`）：
+
+```json
+{
+  "id": 1, "exhibitId": 3, "year": 2024,
+  "limit": 100000, "confirmedTotal": 450, "residueTotal": 800, "total": 1250,
+  "items": [
+    { "sourceKey": "measurement:31", "kind": "measurement", "id": 31,
+      "label": "实测 #31（计划 #7）", "planId": 7,
+      "start": "2024-05-01 09:00", "end": "2024-05-01 12:00", "lux": 150, "yearDose": 450 },
+    { "sourceKey": "plan:7", "kind": "plan", "id": 7,
+      "label": "估算残余 · 计划 #7「春季特展」", "title": "春季特展", "status": "approved",
+      "startDate": "2024-05-01", "endDate": "2024-05-01",
+      "periods": ["09:00-17:00"], "lux": 100, "yearDose": 500 },
+    { "sourceKey": "plan:8", "kind": "plan", "id": 8, "yearDose": 300 }
+  ],
+  "sealedBy": 1, "sealedByName": "保管员（默认）",
+  "sealedAt": "2025-01-05T02:10:00.000Z", "sealedAtWall": "2025-01-05 10:10",
+  "tzOffsetMinutes": 480
+}
+```
+
+`GET …/ledgers/:year` 的对照部分（封存之后实测纠错、计划取消、上限变化都可能改变当前值；
+封存值始终原样保留）：
+
+```json
+{
+  "ledger": { "id": 1, "year": 2024, "limit": 100000, "confirmedTotal": 450,
+               "residueTotal": 800, "total": 1250, "items": [ ] },
+  "current": { "year": 2024, "limit": 90000, "confirmedTotal": 800,
+               "residueTotal": 400, "total": 1200, "items": [ ] },
+  "comparison": {
+    "year": 2024,
+    "totals": {
+      "limit":          { "sealedDose": 100000, "currentDose": 90000, "delta": -10000, "zeroDifference": false },
+      "confirmedTotal": { "sealedDose": 450, "currentDose": 800, "delta": 350, "zeroDifference": false },
+      "residueTotal":   { "sealedDose": 800, "currentDose": 400, "delta": -400, "zeroDifference": false },
+      "total":          { "sealedDose": 1250, "currentDose": 1200, "delta": -50, "zeroDifference": false }
+    },
+    "itemDiffs": [
+      { "sourceKey": "measurement:31", "kind": "measurement", "id": 31,
+        "sealed": true, "present": false, "sealedDose": 450, "currentDose": null,
+        "delta": -450, "zeroDifference": false },
+      { "sourceKey": "measurement:32", "kind": "measurement", "id": 32,
+        "sealed": false, "present": true, "sealedDose": null, "currentDose": 800,
+        "delta": 800, "zeroDifference": false },
+      { "sourceKey": "plan:7", "kind": "plan", "id": 7,
+        "sealed": true, "present": true, "sealedDose": 500, "currentDose": 400,
+        "delta": -100, "zeroDifference": false },
+      { "sourceKey": "plan:8", "kind": "plan", "id": 8,
+        "sealed": true, "present": false, "sealedDose": 300, "currentDose": null,
+        "delta": -300, "zeroDifference": false }
+    ]
+  }
+}
+```
+
+差额字段一律为“当前 − 封存”。`present=false` 表示**已消失来源**（封存后作废的实测、取消/驳回而退出
+占用的计划），仍列出且 `currentDose=null`；`sealed=false` 表示封存后新增来源；
+**零差额逐项 `zeroDifference: true` 且 `delta: 0`**，封存瞬间的对照所有字段/逐项均为零差额。
+展品详情（`GET /api/exhibits/:id`）的每条 `ledgers[]` 内嵌同样的 `comparison`，**既有字段不变**。
+封存与同展品的批准、确认、纠错、调整等经同一展品键锁 + 行锁串行，账册不会混入变动前后两截数据。
+审计写入一条 `ledger.seal`（target 为账册编号，detail 含年份、上限、各合计与来源条数）。
 
 
 ```
@@ -788,9 +903,11 @@ src/
   limit-preview.js 下调上限预演凭证（签发/一次性消耗/占用指纹）
   validation.js    中文输入校验（时段/日期/正数等）
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
+  ledger.js        年度用光账册封存：按年快照构建（复用统一占用口径）、封存校验落账、封存值与当前重算的逐项/合计差额对照
   service.js       额度占用计算、批准校验、实测窗口校验、实测纠错（旧记录作废+替代记录确认+关联）、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组试算/核对、下调上限预演核算、停灯登记校验与按年扣减
-  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/blackouts/audit 路由
+  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/blackouts/ledgers（年度账册封存与对照）/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试
+scripts/test-integration.js  基于 pg-mem 的端到端业务流程测试（含年度账册封存/对照/并发）
 Dockerfile / docker-compose.yml
 ```

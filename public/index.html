@@ -131,6 +131,18 @@
             起点须早于终点，结束不得晚于当前时间；时段必须完整落在所选计划的开灯窗内，
             且不得与同展品未作废实测或其他停灯记录相交。失败会指出冲突且不保存。
           </p>
+
+          <h4>年度用光账册（封存后不可修改/覆盖）</h4>
+          <p class="muted small">保管员可对<b>已结束的自然年</b>封存一份用光账册：原子记录当年上限、已确认实测、
+            各计划扣除实测覆盖与停灯后的估算残余、合计及逐项来源（沿用固定时区与现有剂量口径）。
+            封存后实测纠错、计划状态或上限变化仍按现有流程生效，旧账始终不可改；
+            下表对照封存值与按当前数据重算的同年值，已消失来源仍列出，零差额明确标示「0 / 无差额」。</p>
+          <form id="ledger-form" class="inline-form conservator-only">
+            <span>封存已结束年份的用光账册：</span>
+            <input name="year" type="number" min="1900" max="2999" placeholder="年份，如 2024" required />
+            <button class="primary">封存账册</button>
+          </form>
+          <div id="ledger-list"></div>
         </div>
       </section>
 

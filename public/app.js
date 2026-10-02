@@ -220,6 +220,7 @@ function renderDetail() {
   $('#detail-meas-tbody').innerHTML = d.measurements.map(measRow).join('') ||
     '<tr><td colspan="7" class="muted">暂无实测</td></tr>';
   renderBlackouts(d);
+  renderLedgers(d);
 
   $$('.plan-action').forEach((btn) => btn.addEventListener('click', () => planAction(btn)));
   $$('.meas-action').forEach((btn) => btn.addEventListener('click', () => measAction(btn)));
@@ -227,6 +228,92 @@ function renderDetail() {
   $$('.adj-open').forEach((btn) => btn.addEventListener('click', () => openAdjustmentForm(Number(btn.dataset.id))));
   renderPairBox();
 }
+
+/**
+ * 渲染已封存年度账册及与当前重算值的对照（仅展示后端附加字段，不改既有数据）。
+ * 合计差额与逐项差额明确标示；已消失来源（present=false / sealed=false）仍列出。
+ */
+function renderLedgers(d) {
+  const box = $('#ledger-list');
+  if (!box) return;
+  const ledgers = d.ledgers || [];
+  if (!ledgers.length) {
+    box.innerHTML = '<p class="muted small">尚无已封存年度账册。</p>';
+    return;
+  }
+  box.innerHTML = ledgers.map((lg) => {
+    const cmp = lg.comparison || null;
+    const t = cmp ? cmp.totals : null;
+    const deltaCell = (f) => {
+      if (!f) return '<span class="muted">—</span>';
+      if (f.delta === null) {
+        return f.sealedDose === null && f.currentDose !== null
+          ? '<span class="tag new">封存后新增</span>'
+          : '<span class="muted">—</span>';
+      }
+      if (f.zeroDifference) return '<span class="tag zero">0（无差额）</span>';
+      const cls = f.delta > 0 ? 'up' : 'down';
+      return `<span class="tag ${cls}">${f.delta > 0 ? '+' : ''}${fmtN(f.delta)}</span>`;
+    };
+    const rows = cmp
+      ? cmp.itemDiffs.map((it) => {
+          let state = '';
+          if (!it.present) state = '<span class="tag gone">已消失来源</span>';
+          else if (!it.sealed) state = '<span class="tag new">封存后新增</span>';
+          else if (it.zeroDifference) state = '<span class="tag zero">无差额</span>';
+          else state = `<span class="tag ${it.delta > 0 ? 'up' : 'down'}">${it.delta > 0 ? '+' : ''}${fmtN(it.delta)}</span>`;
+          return `<tr${!it.present ? ' class="over-row"' : ''}>
+            <td>${it.kind === 'measurement' ? '实测' : '估算残余'}</td>
+            <td>#${it.id}</td>
+            <td class="small">${esc(it.label)}</td>
+            <td class="mono">${it.sealedDose === null ? '<span class="muted">—</span>' : fmtN(it.sealedDose)}</td>
+            <td class="mono">${it.currentDose === null ? '<span class="muted">已消失</span>' : fmtN(it.currentDose)}</td>
+            <td>${state}</td>
+          </tr>`;
+        }).join('')
+      : '';
+    return `<div class="card ledger-card">
+      <div class="panel-head">
+        <h4>${lg.year} 年用光账册 <span class="muted small">（封存于 ${esc(lg.sealedAtWall || '')}，${esc(lg.sealedByName || '—')}）</span></h4>
+      </div>
+      <table class="data ledger-summary">
+        <thead><tr><th>口径</th><th>封存值</th><th>当前重算</th><th>差额（当前 − 封存）</th></tr></thead>
+        <tbody>
+          <tr><td>年度上限</td><td class="mono">${lg.limit === null ? '未登记' : fmtN(lg.limit)}</td>
+            <td class="mono">${t && t.limit.currentDose !== null ? fmtN(t.limit.currentDose) : '—'}</td><td>${deltaCell(t && t.limit)}</td></tr>
+          <tr><td>已确认实测合计</td><td class="mono">${fmtN(lg.confirmedTotal)}</td>
+            <td class="mono">${t ? fmtN(t.confirmedTotal.currentDose) : '—'}</td><td>${deltaCell(t && t.confirmedTotal)}</td></tr>
+          <tr><td>各计划估算残余合计</td><td class="mono">${fmtN(lg.residueTotal)}</td>
+            <td class="mono">${t ? fmtN(t.residueTotal.currentDose) : '—'}</td><td>${deltaCell(t && t.residueTotal)}</td></tr>
+          <tr><td><b>合计</b></td><td class="mono"><b>${fmtN(lg.total)}</b></td>
+            <td class="mono"><b>${t ? fmtN(t.total.currentDose) : '—'}</b></td><td>${deltaCell(t && t.total)}</td></tr>
+        </tbody>
+      </table>
+      <details class="ledger-items" open>
+        <summary class="small muted">逐项来源对照（按来源编号对齐，已消失来源仍列出）</summary>
+        <table class="data">
+          <thead><tr><th>类型</th><th>#</th><th>来源</th><th>封存剂量</th><th>当前剂量</th><th>差额 / 标记</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="6" class="muted">无对照数据</td></tr>'}</tbody>
+        </table>
+      </details>
+    </div>`;
+  }).join('');
+}
+
+$('#ledger-form')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!state.detail) return;
+  const fd = new FormData(e.target);
+  const year = Number(fd.get('year'));
+  try {
+    await api('POST', `/api/exhibits/${state.detail.exhibit.id}/ledgers`, { year });
+    e.target.reset();
+    await openDetail(state.detail.exhibit.id);
+    flash('success', `${year} 年用光账册已封存（旧账不可修改或覆盖）`);
+  } catch (err) {
+    flash('error', err.message);
+  }
+});
 
 /** 渲染停灯记录与各年扣减量，并填充登记表单的计划下拉（仅已批准/待复核）。 */
 function renderBlackouts(d) {

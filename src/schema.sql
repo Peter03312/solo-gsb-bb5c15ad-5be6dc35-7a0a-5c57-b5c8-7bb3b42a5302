@@ -139,6 +139,27 @@ CREATE TABLE IF NOT EXISTS blackouts (
 CREATE INDEX IF NOT EXISTS idx_blackout_exhibit ON blackouts (exhibit_id, id);
 CREATE INDEX IF NOT EXISTS idx_blackout_plan ON blackouts (plan_id, id);
 
+-- 年度用光账册封存（保管员可对展品“已结束的自然年”封存一份不可变账册）。
+-- 封存时按当时的固定时区与统一剂量口径原子记录：
+--   当年上限、已确认实测剂量合计、各计划“开灯窗 − 已确认实测覆盖 − 本计划停灯”的估算残余、
+--   合计（= 实测合计 + 残余合计）及逐项来源（snapshot_json，含每条来源的按年剂量）。
+-- 账册一经封存永久不可修改/覆盖（UNIQUE(exhibit_id, year) 兜底，重复提交返回 409）；
+-- 封存之后实测纠错、计划状态/调整、上限变化等照常按既有流程生效，本表任何接口都不改写。
+CREATE TABLE IF NOT EXISTS annual_ledgers (
+    id              BIGSERIAL PRIMARY KEY,
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    year            INTEGER NOT NULL CHECK (year BETWEEN 1900 AND 2999),
+    limit_lxh       NUMERIC(12,3),
+    confirmed_lxh   NUMERIC(12,3) NOT NULL,
+    residue_lxh     NUMERIC(12,3) NOT NULL,
+    total_lxh       NUMERIC(12,3) NOT NULL,
+    snapshot_json   JSONB NOT NULL,
+    created_by      BIGINT REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (exhibit_id, year)
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_exhibit ON annual_ledgers (exhibit_id, year);
+
 -- 操作流水（审批、确认、状态变更等全部保留）
 CREATE TABLE IF NOT EXISTS audit_events (
     id              BIGSERIAL PRIMARY KEY,
